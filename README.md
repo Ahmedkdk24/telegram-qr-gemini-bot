@@ -1,6 +1,6 @@
 # 🤖 Telegram QR Gemini Bot
 
-A Telegram bot powered by **Google Gemini Pro Vision**, hosted serverlessly on **Cloudflare Workers**.  
+A Telegram bot powered by **Google Gemini 1.5 Flash**, hosted serverlessly on **Cloudflare Workers**.  
 This bot can understand both **text and image messages**, intelligently describe photo content, and even **extract URLs from QR codes**.
 
 ---
