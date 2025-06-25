@@ -1,4 +1,4 @@
-# 🤖 Telegram QR Gemini Bot
+# 🤖 AI Chatbot Telegram
 
 A Telegram bot powered by **Google Gemini 1.5 Flash**, hosted serverlessly on **Cloudflare Workers**.  
 This bot can understand both **text and image messages**, intelligently describe photo content, and even **extract URLs from QR codes**.
@@ -46,17 +46,43 @@ Before you begin, make sure you have:
 ## 🧠 2. Enable Gemini API (Google AI Studio)
 
 1. Go to [Google AI Studio](https://makersuite.google.com/)
+
+![AI Studio API](images/AI-Studio-API-Key-1.png)
+![Create API Key](images/Create-API-Key-2.png)
+
 2. Enable the **Gemini API**
-3. Then visit the [Google Cloud Console](https://console.cloud.google.com/)
-   - Enable the **Generative Language API**
-   - Generate a new **API Key**
+
+![Create API KEY](images/Create-API-Key-2.png)
+
+3. Choose you existing GoogleCloud project, or create the API Key in a new project
+
+![Create APT Key in a new project](images/create-api-key-in-a-new-project-2-5.png)
+
 4. Copy this key — you’ll need it in the next step
+
+![Copy API Key](images/api-key-generated-3.png)
 
 > ⚠️ Note: A billing account may be required.
 
 ---
 
 ## ☁️ 3. Set Up Cloudflare Worker
+
+## Prerequesites:
+  - Sign up for a [Cloudflare account](https://dash.cloudflare.com/sign-up/workers-and-pages)
+
+  ![Cloudflare Signup page](images/create-cloudflare-acc-4.png)
+
+  - Install [Node.js](https://docs.npmjs.com/downloading-and-installing-node-js-and-npm)
+
+  - Create a [Cloudflare AI Gateway account](https://developers.cloudflare.com/ai-gateway/get-started/)
+
+  ![Create AI Gateway account](images/AI-Gateway-5.png)
+
+  - Optain your account-id and gateway-name from the log page
+
+  ![Accout-ID, Gateway-Name](images/Gateway-id-name-6.png)
+
 
 ### 🔧 Install Wrangler CLI
 
@@ -68,7 +94,7 @@ npm install -g wrangler
 
 ```bash
 git clone https://github.com/Ahmedkdk24/telegram-qr-gemini-bot.git
-cd telegram-gemini-bot
+cd telegram-qr-gemini-bot
 ```
 
 ### 🔐 Authenticate with Cloudflare
@@ -85,7 +111,7 @@ In your `wrangler.jsonc` file, set your keys and IDs:
 
 ```jsonc
 {
-  "name": "telegram-gemini-bot",
+  "name": "ai-chatbot-telegram",
   "main": "src/index.js",
   "compatibility_date": "2024-05-01",
 

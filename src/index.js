@@ -276,4 +276,3 @@ async function tryDecodeQrCodeBase64(imageBuffer) {
     return null;
   }
 }
-
