@@ -197,4 +197,4 @@ Feel free to fork, remix, and improve this bot.
 
 ## 📄 License
 
-MIT License © 2025 [Ahmedkdk24](https://github.com/Ahmedkdk24)
+MIT License © 2025 [INFREV](https://gitlab.com/infrev)
