@@ -1,73 +1,89 @@
-const TOKEN = TELEGRAM_TOKEN;// Obtain from @Botfather
-const WEBHOOK = '/endpoint';
-const SECRET = TELEGRAM_SECRET; // Create on Cloudflare Dashboard
-const api_token = GOOGLE_API_KEY; // Obtain from Google Studio
-const account_id = ACCOUNT_ID; //Cloudflare Account ID
-const gateway_name = GATEWAY_NAME; // Cloudflare AI Gateway ID
-const model = 'gemini-1.5-flash'; 
-const generative_ai_rest_resource = 'generateContent';
+// src/index.js
 
-const GEMENI_API_ENDPOINT = `https://gateway.ai.cloudflare.com/v1/${account_id}/${gateway_name}/google-ai-studio/v1/models/${model}:${generative_ai_rest_resource}`;
+// --- Constants from environment variables ---
+const TOKEN = TELEGRAM_TOKEN;
+const WEBHOOK = '/endpoint';
+const SECRET = TELEGRAM_SECRET;
+const API_TOKEN = GOOGLE_API_KEY;
+const MODEL = 'gemini-2.5-flash-lite'; // Note: Gemini 2.0 is the current stable version
+const GENERATIVE_AI_REST_RESOURCE = 'generateContent';
+
+const GEMINI_API_ENDPOINT = `https://generativelanguage.googleapis.com/v1/models/${MODEL}:${GENERATIVE_AI_REST_RESOURCE}?key=${API_TOKEN}`;
+
+console.log(`🤖 Bot configured with ${MODEL}`);
 
 /**
- * Wait for requests to the worker
+ * Cloudflare Worker fetch event handler
  */
 addEventListener('fetch', event => {
   const url = new URL(event.request.url);
+
   if (url.pathname === WEBHOOK) {
     event.respondWith(handleWebhook(event));
   } else if (url.pathname === '/registerWebhook') {
     event.respondWith(registerWebhook(event, url, WEBHOOK, SECRET));
   } else if (url.pathname === '/unRegisterWebhook') {
-    event.respondWith(unRegisterWebhook(event));
+    event.respondWith(unRegisterWebhook());
   } else {
     event.respondWith(new Response('No handler for this request'));
   }
 });
 
 /**
- * Handle requests to WEBHOOK
+ * Handle Telegram webhook events
  */
 async function handleWebhook(event) {
-  // Check secret
   if (event.request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== SECRET) {
     return new Response('Unauthorized', { status: 403 });
   }
 
-  // Read request body
-  const update = await event.request.json();
-  // Process update
-  event.waitUntil(onUpdate(update));
-
-  return new Response('Ok');
+  try {
+    const update = await event.request.json();
+    event.waitUntil(onUpdate(update));
+    return new Response('Ok');
+  } catch (err) {
+    return new Response('Bad Request', { status: 400 });
+  }
 }
 
-/**
- * Handle incoming Update
- */
 async function onUpdate(update) {
   if ('message' in update) {
     await onMessage(update.message);
   }
 }
 
-/**
- * Handle incoming Message
- */
 async function onMessage(message) {
-  console.log("📩 Full message object:", JSON.stringify(message, null, 2));
+  const chatId = message.chat.id;
 
   if (message.text) {
-    return handleText(message.chat.id, message.text);
-  } else if (message.photo || (message.document && message.document.mime_type.startsWith('image/'))) {
-    const fileId = message.photo 
-      ? message.photo[message.photo.length - 1].file_id 
+    return handleText(chatId, message.text);
+  } else if (message.photo || (message.document && message.document.mime_type?.startsWith('image/'))) {
+    const fileId = message.photo
+      ? message.photo[message.photo.length - 1].file_id
       : message.document.file_id;
-
-    return handleImage(message.chat.id, fileId);
+    return handleImage(chatId, fileId);
   } else {
-    return sendPlainText(message.chat.id, '📝 I can only process text messages and images for now.');
+    return sendPlainText(chatId, '📝 I can only process text and images.');
   }
+}
+
+/**
+ * Core Gemini API Caller
+ */
+async function queryGemini(contents) {
+  const response = await fetch(GEMINI_API_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: contents }]
+    })
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(`Gemini API error: ${response.status} - ${JSON.stringify(data)}`);
+  }
+  return data;
 }
 
 async function handleText(chatId, text) {
@@ -76,8 +92,7 @@ async function handleText(chatId, text) {
     const replyText = extractGeminiText(geminiResult);
     return sendPlainText(chatId, replyText);
   } catch (error) {
-    console.error("⚠️ Gemini processing error:", error);
-    return sendPlainText(chatId, '😔 Sorry, something went wrong. Please try again later.');
+    return sendPlainText(chatId, '😔 Error connecting to AI. Try again.');
   }
 }
 
@@ -85,194 +100,84 @@ async function handleImage(chatId, fileId) {
   try {
     const fileMetaRes = await fetch(apiUrl('getFile', { file_id: fileId }));
     const fileMetaData = await fileMetaRes.json();
-    if (!fileMetaData.ok) throw new Error("Failed to get file path from Telegram");
+    if (!fileMetaData.ok) throw new Error("Failed to get file metadata");
 
-    const filePath = fileMetaData.result.file_path.trim();
-    const encodedFilePath = encodeURIComponent(filePath).replace(/%2F/g, '/');
-    const fileUrl = `https://api.telegram.org/file/bot${TOKEN}/${encodedFilePath}`;
+    const filePath = fileMetaData.result.file_path;
+    const fileUrl = `https://api.telegram.org/file/bot${TOKEN}/${filePath}`;
 
     const imageResp = await fetch(fileUrl);
-    let mimeType = imageResp.headers.get("content-type");
-
-    if (!mimeType || mimeType === "application/octet-stream") {
-      if (filePath.endsWith('.jpg') || filePath.endsWith('.jpeg')) mimeType = 'image/jpeg';
-      else if (filePath.endsWith('.png')) mimeType = 'image/png';
-      else if (filePath.endsWith('.webp')) mimeType = 'image/webp';
-      else throw new Error(`Unsupported image type: ${filePath}`);
-    }
-
     const arrayBuffer = await imageResp.arrayBuffer();
-    if (arrayBuffer.byteLength > 16 * 1024 * 1024) {
-      throw new Error("Image too large for processing.");
-    }
-
+    
     const base64Image = arrayBufferToBase64(arrayBuffer);
+    const mimeType = await detectMimeType(arrayBuffer, filePath);
 
-    // Step 1: Get Gemini response
+    // Gemini requires a text part alongside the image part for context
     const geminiResult = await queryGemini([
+      { text: "What is in this image? Provide a detailed description." },
       {
         inlineData: {
-          mimeType,
+          mimeType: mimeType,
           data: base64Image
         }
       }
     ]);
-    const geminiText = extractGeminiText(geminiResult);
 
-    // Step 2: Try QR decoding
-    const qrDecoded = await tryDecodeQrCodeBase64(arrayBuffer);
-    const qrText = qrDecoded ? `\n\n🔍 QR Code Result:\n${qrDecoded}` : '';
-
-    // Step 3: Send combined reply
-    const finalReply = `${geminiText}${qrText}`;
-    return sendPlainText(chatId, finalReply);
-
+    return sendPlainText(chatId, extractGeminiText(geminiResult));
   } catch (error) {
-    console.error("⚠️ Image processing error:", error);
-    return sendPlainText(chatId, '🖼️ Could not process the image. Try again with a clear photo under 16MB.');
+    return sendPlainText(chatId, '🖼️ Error: ' + error.message);
   }
 }
 
-
-
-
-// Modified sendPlainText with retry support
-async function sendPlainText(chatId, text) {
-  return retry(async () => {
-    const response = await fetch(apiUrl('sendMessage', {
-      chat_id: chatId,
-      text
-    }));
-
-    if (!response.ok) {
-      throw new Error(`Telegram API error: ${response.status} - ${await response.text()}`);
-    }
-
-    return await response.json();
-  });
-}
-
-
 /**
- * Construct Telegram API URL
+ * Helper Utilities
  */
-function apiUrl(method, params) {
+function apiUrl(method, params = {}) {
   const query = new URLSearchParams(params).toString();
-  return `https://api.telegram.org/bot${TOKEN}/${method}?${query}`;
+  return `https://api.telegram.org/bot${TOKEN}/${method}${query ? '?' + query : ''}`;
 }
 
-/**
- * Set webhook to this worker's URL
- */
-async function registerWebhook(event, requestUrl, suffix, secret) {
-  const webhookUrl = `${requestUrl.protocol}//${requestUrl.hostname}${suffix}`;
-  const r = await (await fetch(apiUrl('setWebhook', {
-    url: webhookUrl,
-    secret_token: secret
-  }))).json();
-  return new Response('ok' in r && r.ok ? 'Ok' : JSON.stringify(r, null, 2));
-}
-
-// Modified sendPlainText with retry support
 async function sendPlainText(chatId, text) {
-  return retry(async () => {
-    const response = await fetch(apiUrl('sendMessage', {
-      chat_id: chatId,
-      text
-    }));
-
-    if (!response.ok) {
-      throw new Error(`Telegram API error: ${response.status} - ${await response.text()}`);
-    }
-
-    return await response.json();
-  });
+  return fetch(apiUrl('sendMessage', {
+    chat_id: chatId,
+    text: text
+  }));
 }
 
-// Utility: Retry helper with exponential backoff
-async function retry(fn, retries = 3, delay = 500) {
-  try {
-    return await fn();
-  } catch (err) {
-    if (retries <= 0) throw err;
-    await new Promise(res => setTimeout(res, delay));
-    return retry(fn, retries - 1, delay * 2);
-  }
-}
-
-async function getTelegramFileUrl(fileId) {
-  const res = await fetch(apiUrl('getFile', { file_id: fileId }));
-  const data = await res.json();
-  if (!data.ok) throw new Error("Failed to get file path from Telegram");
-  const filePath = data.result.file_path;
-  return `https://api.telegram.org/file/bot${TOKEN}/${filePath}`;
-}
-
-async function queryGemini(parts) {
-  const response = await fetch(`${GEMENI_API_ENDPOINT}?key=${api_token}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ parts }]
-    })
-  });
-
-  const text = await response.text();
-  console.log("Gemini raw response:", text);
-
-  if (!response.ok) {
-    throw new Error(`Gemini API error: ${response.status} - ${text}`);
-  }
-
-  return JSON.parse(text);
+async function detectMimeType(arrayBuffer, filePath) {
+  const bytes = new Uint8Array(arrayBuffer.slice(0, 4));
+  // Magic bytes check
+  if (bytes[0] === 0xFF && bytes[1] === 0xD8) return 'image/jpeg';
+  if (bytes[0] === 0x89 && bytes[1] === 0x50) return 'image/png';
+  if (bytes[0] === 0x47 && bytes[1] === 0x49) return 'image/gif';
+  if (bytes[0] === 0x52 && bytes[1] === 0x49) return 'image/webp';
+  
+  // Strict fallback: Gemini rejects application/octet-stream
+  return 'image/jpeg'; 
 }
 
 function extractGeminiText(result) {
-  try {
-    return result.candidates?.[0]?.content?.parts?.[0]?.text || '🤖 No reply.';
-  } catch (err) {
-    console.error("Reply extract error:", err);
-    return '🤖 Gemini replied, but something went wrong reading it.';
-  }
+  return result.candidates?.[0]?.content?.parts?.[0]?.text || '🤖 No reply.';
 }
 
 function arrayBufferToBase64(buffer) {
   let binary = '';
   const bytes = new Uint8Array(buffer);
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
+  for (let i = 0; i < bytes.length; i++) {
     binary += String.fromCharCode(bytes[i]);
   }
   return btoa(binary);
 }
 
-async function tryDecodeQrCodeBase64(imageBuffer) {
-  const boundary = '----WebKitFormBoundary7MA4YWxkTrZu0gW';
+/**
+ * Webhook Registration Helpers
+ */
+async function registerWebhook(event, url, WEBHOOK, SECRET) {
+  const webhookUrl = `${url.protocol}//${url.hostname}${WEBHOOK}`;
+  const r = await fetch(apiUrl('setWebhook', { url: webhookUrl, secret_token: SECRET }));
+  return new Response(JSON.stringify(await r.json()), { headers: { 'content-type': 'application/json' } });
+}
 
-  const blob = new Blob([
-    `--${boundary}\r\n`,
-    `Content-Disposition: form-data; name="file"; filename="image.jpg"\r\n`,
-    `Content-Type: image/jpeg\r\n\r\n`,
-    new Uint8Array(imageBuffer), `\r\n`,
-    `--${boundary}--`
-  ]);
-
-  try {
-    const response = await fetch('https://api.qrserver.com/v1/read-qr-code/', {
-      method: 'POST',
-      headers: {
-        'Content-Type': `multipart/form-data; boundary=${boundary}`,
-      },
-      body: blob
-    });
-
-    const result = await response.json();
-    console.log("📦 QR decode result:", JSON.stringify(result, null, 2));
-    const decodedText = result?.[0]?.symbol?.[0]?.data;
-    return decodedText || null;
-
-  } catch (error) {
-    console.error("QR decoding error:", error);
-    return null;
-  }
+async function unRegisterWebhook() {
+  const r = await fetch(apiUrl('setWebhook', { url: '' }));
+  return new Response(JSON.stringify(await r.json()), { headers: { 'content-type': 'application/json' } });
 }
