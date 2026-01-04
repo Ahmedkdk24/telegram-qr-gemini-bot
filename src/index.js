@@ -77,12 +77,11 @@ async function setCurrentExerciseId(kv, chatId, exerciseId) {
  */
 export default {
   async fetch(request, env, ctx) {
-    // Always ensure bindings are initialized from env for this request
     TOKEN = env?.TELEGRAM_TOKEN || TOKEN;
     SECRET = env?.TELEGRAM_SECRET || SECRET;
     API_TOKEN = env?.GOOGLE_API_KEY || API_TOKEN;
     
-    console.log(`🔧 Bindings initialized - TOKEN: ${TOKEN ? '✓' : '✗'}, SECRET: ${SECRET ? '✓' : '✗'}, API_TOKEN: ${API_TOKEN ? '✓' : '✗'}`);
+    console.log(`🔧 Bindings initialized ...`);
 
     const url = new URL(request.url);
     console.log(`🌐 Received request: ${url.pathname}`);
@@ -93,7 +92,33 @@ export default {
       return registerWebhook(request, env, url);
     } else if (url.pathname === '/unRegisterWebhook') {
       return unRegisterWebhook();
-    } else {
+    }
+
+    else if (url.pathname.startsWith('/getAnswerKey')) {
+      const id = url.searchParams.get('id');
+      if (!id) return new Response('Missing id', { status: 400 });
+
+      const data = await getExerciseFromKV(env.EXERCISES_KV, id);
+      return new Response(JSON.stringify(data, null, 2), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    else if (url.pathname.startsWith('/getSubmissions')) {
+      const id = url.searchParams.get('id');
+      if (!id) return new Response('Missing id', { status: 400 });
+
+      const data = await getSubmissionsFromKV(env.EXERCISES_KV, id);
+      if (!data) {
+        return new Response(`No submissions found for exercise ${id}`, { status: 404 });
+      }
+
+      return new Response(JSON.stringify(data, null, 2), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    else {
       return new Response('No handler for this request');
     }
   }
@@ -229,20 +254,36 @@ async function handleExercisePdf(chatId, fileId, kv) {
 
     const prompt = `
 You are an English teacher assistant.
-Extract ONLY the correct answers for exercise 73.
-Return JSON ONLY.
+Extract ALL exercises and their correct answers from this PDF.
+Return JSON ONLY — no text outside JSON.
 
-Format:
+Expected structure (example):
+
 {
- "exercise_id":"73",
- "sections":{
-   "73.1":{"categories":{...}},
-   "73.2":{"answers":{...}},
-   "73.3":{"answers":{...},"lexical_invalid":["full days"]}
- }
+  "exercises": {
+    "73": {
+      "sections": {
+        "73.1": { "answers": {...} },
+        "73.2": { "answers": {...} },
+        "73.3": { "answers": {...} },
+        ...
+      }
+    },
+    "74": {
+      "sections": {
+        "74.1": { "answers": {...} },
+        "74.2": { "answers": {...} }
+      }
+    },
+    ...
+  }
 }
-Lowercase everything.
-No explanations.
+
+Rules:
+- Include every exercise number that appears in the PDF (e.g., 73, 74, 75, etc.)
+- Preserve each exercise’s internal numbering (e.g., 73.1, 74.2, etc.)
+- Lowercase everything.
+- Do NOT explain or comment.
 `;
 
     console.log('🧠 Sending PDF to Gemini...');
@@ -263,8 +304,13 @@ No explanations.
     const answerKey = JSON.parse(cleanJson);
     console.log(`✅ Parsed answer key for exercise: ${answerKey.exercise_id}`);
 
-    await setExerciseInKV(kv, answerKey.exercise_id, answerKey);
-    await setCurrentExerciseId(kv, chatId, answerKey.exercise_id);
+    for (const [exerciseId, data] of Object.entries(answerKey.exercises)) {
+      await setExerciseInKV(kv, exerciseId, data);
+      await setCurrentExerciseId(kv, chatId, exerciseId);
+      console.log(`💾 Stored exercise ${exerciseId} in KV`);
+    }
+
+    return sendPlainText(chatId, `✅ All exercises registered.\nAnswer keys created.`);
 
     console.log(`💾 Stored exercise ${answerKey.exercise_id} in KV`);
     return sendPlainText(
@@ -294,18 +340,21 @@ async function handleStudentImage(chatId, from, fileId, kv) {
     console.log(`🖼️ Image downloaded, base64 length: ${base64Image.length}`);
 
     const prompt = `
-Extract ONLY the student's answers.
-No corrections.
-Return JSON ONLY.
+You are an English teacher assistant.
+Extract ONLY the student's answers from this image.
+Detect which exercise number the answers belong to (e.g., 73, 74, 75, etc.).
+Return JSON ONLY — no explanations.
 
-Format:
+Format example:
 {
- "sections":{
-   "73.1":{...},
-   "73.2":{...},
-   "73.3":{...}
- }
+  "exercise_id": "74",
+  "sections": {
+    "74.1": { ... },
+    "74.2": { ... },
+    ...
+  }
 }
+Lowercase everything.
 `;
 
     console.log('🧠 Sending image to Gemini...');
@@ -325,22 +374,71 @@ Format:
     const cleanJson = extractJsonFromMarkdown(geminiText);
     const submission = JSON.parse(cleanJson);
     const studentId = from.id;
-    
-    console.log(`👨‍🎓 Student ${studentId} submission extracted`);
-    SUBMISSIONS[CURRENT_EXERCISE_ID][studentId] = submission;
+    const exerciseId = submission.exercise_id;
 
-    const answerKey = await getExerciseFromKV(kv, CURRENT_EXERCISE_ID);
+    if (!exerciseId) {
+      console.log('⚠️ Gemini did not return an exercise_id');
+      return sendPlainText(chatId, '⚠️ Could not detect which exercise this is for.');
+    }
+
+    console.log(`👨‍🎓 Student ${studentId} submission extracted for exercise ${exerciseId}`);
+
+    // ✅ Save to KV for persistence
+    await saveSubmissionToKV(kv, exerciseId, studentId, submission);
+
+    const answerKey = await getExerciseFromKV(kv, exerciseId);
     if (!answerKey) {
-      throw new Error('Answer key not found in KV');
+      console.log(`⚠️ No answer key found for exercise ${exerciseId}`);
+      return sendPlainText(chatId, `⚠️ No answer key found for exercise ${exerciseId}.`);
     }
 
     const report = gradeSubmission(submission, answerKey);
 
     console.log('📊 Grading complete');
     return sendPlainText(chatId, buildReport(report));
+
+    console.log('📊 Grading complete');
+    return sendPlainText(chatId, buildReport(report));
   } catch (error) {
     console.error('❌ Error processing image:', error);
     return sendPlainText(chatId, '❌ Error processing image: ' + error.message);
+  }
+}
+
+/**
+ * ====== SUBMISSIONS KV HELPERS ======
+ */
+async function getSubmissionsFromKV(kv, exerciseId) {
+  try {
+    if (!kv) {
+      console.log('⚠️ KV not available, using in-memory fallback');
+      return SUBMISSIONS[exerciseId] || {};
+    }
+    const data = await kv.get(`submissions:${exerciseId}`, 'json');
+    console.log(`📦 KV.get(submissions:${exerciseId}) returned:`, data ? 'found' : 'null');
+    return data || {};
+  } catch (err) {
+    console.error('❌ KV.get submissions error:', err);
+    return {};
+  }
+}
+
+async function saveSubmissionToKV(kv, exerciseId, studentId, submission) {
+  try {
+    if (!kv) {
+      console.log('⚠️ KV not available, updating in-memory fallback');
+      if (!SUBMISSIONS[exerciseId]) SUBMISSIONS[exerciseId] = {};
+      SUBMISSIONS[exerciseId][studentId] = submission;
+      return;
+    }
+
+    const current = await getSubmissionsFromKV(kv, exerciseId);
+    current[studentId] = submission;
+
+    await kv.put(`submissions:${exerciseId}`, JSON.stringify(current));
+    console.log(`💾 Saved submission for student ${studentId} in KV`);
+  } catch (err) {
+    console.error('❌ KV.put submissions error:', err);
   }
 }
 
@@ -353,12 +451,37 @@ function normalize(s) {
 
 function gradeSubmission(sub, key) {
   console.log('📝 Grading submission...');
-  return {
-    '73.1': grade731(sub.sections?.['73.1'], key.sections['73.1']),
-    '73.2': grade732(sub.sections?.['73.2'], key.sections['73.2']),
-    '73.3': grade733(sub.sections?.['73.3'], key.sections['73.3'])
-  };
+
+  const results = {};
+  const studentSections = sub.sections || {};
+  const keySections = key.sections || {};
+
+  for (const [sectionName, studentSection] of Object.entries(studentSections)) {
+    console.log(`📊 Grading section ${sectionName}`);
+
+    // Find the corresponding section in the key
+    const keySection = keySections[sectionName];
+    if (!keySection) {
+      console.log(`⚠️ No key found for section ${sectionName}`);
+      results[sectionName] = ['⚠️ Section not found in answer key'];
+      continue;
+    }
+
+    // Decide which grading logic applies based on structure
+    if (keySection.categories) {
+      results[sectionName] = grade731(studentSection, keySection);
+    } else if (keySection.answers) {
+      results[sectionName] = grade732(studentSection, keySection);
+    } else if (keySection.lexical_invalid) {
+      results[sectionName] = grade733(studentSection, keySection);
+    } else {
+      results[sectionName] = ['⚠️ Unknown section type'];
+    }
+  }
+
+  return results;
 }
+
 
 function grade731(student, key) {
   console.log('📊 Grading section 73.1');
@@ -389,15 +512,34 @@ function grade732(student, key) {
     console.log('⚠️ No student data for 73.2');
     return wrong;
   }
+  if (!key || !key.answers) {
+    console.log('⚠️ No answer key data for 73.2');
+    return wrong;
+  }
 
   for (const [q, ans] of Object.entries(student)) {
-    if (!key.answers[q].includes(normalize(ans))) {
+    let correctAnswers = key.answers[q];
+
+    if (!correctAnswers) {
+      console.log(`⚠️ Question ${q} missing in key`);
+      wrong.push(`${q}.${ans} (unknown question)`);
+      continue;
+    }
+
+    // ✅ Ensure correctAnswers is always an array
+    if (!Array.isArray(correctAnswers)) {
+      correctAnswers = [correctAnswers];
+    }
+
+    if (!correctAnswers.map(normalize).includes(normalize(ans))) {
       wrong.push(`${q}.${ans}`);
     }
   }
+
   console.log(`✅ 73.2 wrong answers: ${wrong.length}`);
   return wrong;
 }
+
 
 function grade733(student, key) {
   console.log('📊 Grading section 73.3');
@@ -421,22 +563,22 @@ function grade733(student, key) {
 /**
  * ===== REPORT BUILDER =====
  */
-function buildReport(r) {
+function buildReport(results) {
   console.log('📈 Building report...');
-  return `
-73.1
-${r['73.1'].join('\n')}
-الباقي✅✅✅
+  let text = '';
 
-73.2
-${r['73.2'].join('\n')}
-الباقي✅✅✅
+  for (const [section, feedback] of Object.entries(results)) {
+    text += `\n${section}\n`;
+    if (feedback.length === 0) {
+      text += '✅ All correct\n';
+    } else {
+      text += feedback.join('\n') + '\n';
+    }
+  }
 
-73.3
-${r['73.3'].join('\n')}
-الباقي✅✅✅
-`.trim();
+  return text.trim();
 }
+
 
 /**
  * ===== TELEGRAM HELPERS =====
