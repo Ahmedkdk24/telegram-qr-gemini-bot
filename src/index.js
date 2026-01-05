@@ -1,76 +1,20 @@
 // src/index.js
 
+import KVStore from './kv.js';
+import route from './router.js';
+import { logInfo, logWarn, logError } from './utils.js';
+
 // --- Runtime bindings (initialized from `env` in the fetch handler) ---
 let TOKEN;
 const WEBHOOK = '/endpoint';
 let SECRET;
 let API_TOKEN;
-const MODEL = 'gemini-2.5-flash-lite';
+const MODEL = 'gemini-2.0-flash';
 const GENERATIVE_AI_REST_RESOURCE = 'generateContent';
 
 /**
- * In-memory fallback stores (will use KV for persistence)
+ * KV access will be provided by `KVStore` wrapper instance passed as `kv`.
  */
-const SUBMISSIONS = {};        // { exerciseId: { studentId: submission } }
-
-/**
- * KV helpers for exercises
- */
-async function getExerciseFromKV(kv, exerciseId) {
-  try {
-    if (!kv) {
-      console.log('⚠️ KV binding not available, returning null');
-      return null;
-    }
-    const data = await kv.get(`exercise:${exerciseId}`, 'json');
-    console.log(`📦 KV.get(exercise:${exerciseId}) returned:`, data ? 'found' : 'null');
-    return data || null;
-  } catch (err) {
-    console.error('❌ KV.get error:', err);
-    return null;
-  }
-}
-
-async function setExerciseInKV(kv, exerciseId, answerKey) {
-  try {
-    if (!kv) {
-      console.log('⚠️ KV binding not available, skipping write');
-      return;
-    }
-    await kv.put(`exercise:${exerciseId}`, JSON.stringify(answerKey));
-    console.log(`📦 KV.put(exercise:${exerciseId}) succeeded`);
-  } catch (err) {
-    console.error('❌ KV.put error:', err);
-  }
-}
-
-async function getCurrentExerciseId(kv, chatId) {
-  try {
-    if (!kv) {
-      console.log('⚠️ KV binding not available, returning null');
-      return null;
-    }
-    const id = await kv.get(`chat:${chatId}:current_exercise`, 'text');
-    console.log(`📦 KV.get(chat:${chatId}:current_exercise) returned:`, id || 'null');
-    return id || null;
-  } catch (err) {
-    console.error('❌ KV.get error:', err);
-    return null;
-  }
-}
-
-async function setCurrentExerciseId(kv, chatId, exerciseId) {
-  try {
-    if (!kv) {
-      console.log('⚠️ KV binding not available, skipping write');
-      return;
-    }
-    await kv.put(`chat:${chatId}:current_exercise`, exerciseId);
-    console.log(`📦 KV.put(chat:${chatId}:current_exercise) = ${exerciseId} succeeded`);
-  } catch (err) {
-    console.error('❌ KV.put error:', err);
-  }
-}
 
 /**
  * Module fetch handler (receives `env` and `ctx` from Wrangler/runtime)
@@ -80,47 +24,37 @@ export default {
     TOKEN = env?.TELEGRAM_TOKEN || TOKEN;
     SECRET = env?.TELEGRAM_SECRET || SECRET;
     API_TOKEN = env?.GOOGLE_API_KEY || API_TOKEN;
-    
-    console.log(`🔧 Bindings initialized ...`);
 
-    const url = new URL(request.url);
-    console.log(`🌐 Received request: ${url.pathname}`);
+    logInfo('🔧 Bindings initialized ...');
 
-    if (url.pathname === WEBHOOK) {
-      return handleWebhook(request, ctx, env?.EXERCISES_KV);
-    } else if (url.pathname === '/registerWebhook') {
-      return registerWebhook(request, env, url);
-    } else if (url.pathname === '/unRegisterWebhook') {
-      return unRegisterWebhook();
-    }
+    const kv = new KVStore(env?.EXERCISES_KV);
 
-    else if (url.pathname.startsWith('/getAnswerKey')) {
-      const id = url.searchParams.get('id');
-      if (!id) return new Response('Missing id', { status: 400 });
-
-      const data = await getExerciseFromKV(env.EXERCISES_KV, id);
-      return new Response(JSON.stringify(data, null, 2), {
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-
-    else if (url.pathname.startsWith('/getSubmissions')) {
-      const id = url.searchParams.get('id');
-      if (!id) return new Response('Missing id', { status: 400 });
-
-      const data = await getSubmissionsFromKV(env.EXERCISES_KV, id);
-      if (!data) {
-        return new Response(`No submissions found for exercise ${id}`, { status: 404 });
+    // Handlers wrapper passed to router
+    const handlers = {
+      WEBHOOK_PATH: WEBHOOK,
+      handleWebhook: (request, ctx) => handleWebhook(request, ctx, kv),
+      registerWebhook: (request, env, url) => registerWebhook(request, env, url),
+      unRegisterWebhook: () => unRegisterWebhook(),
+      getAnswerKey: async (request, env, url) => {
+        const id = url.searchParams.get('id');
+        if (!id) return new Response('Missing id', { status: 400 });
+        const data = await kv.getExercise(id);
+        return new Response(JSON.stringify(data, null, 2), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      },
+      getSubmissions: async (request, env, url) => {
+        const id = url.searchParams.get('id');
+        if (!id) return new Response('Missing id', { status: 400 });
+        const data = await kv.getSubmissions(id);
+        if (!data) return new Response(`No submissions found for exercise ${id}`, { status: 404 });
+        return new Response(JSON.stringify(data, null, 2), {
+          headers: { 'Content-Type': 'application/json' }
+        });
       }
+    };
 
-      return new Response(JSON.stringify(data, null, 2), {
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-
-    else {
-      return new Response('No handler for this request');
-    }
+    return route(request, env, ctx, handlers);
   }
 };
 
@@ -169,13 +103,10 @@ async function onMessage(message, kv) {
     return handleExercisePdf(chatId, message.document.file_id, kv);
   }
 
-  if (message.photo || message.document?.mime_type?.startsWith('image/')) {
-    console.log('🖼️ Image received');
-    const fileId = message.photo
-      ? message.photo.at(-1).file_id
-      : message.document.file_id;
-    return handleStudentImage(chatId, message.from, fileId, kv);
-  }
+  if (message.photo || message.document?.mime_type?.startsWith('image/') || message.text) {
+  return handleStudentSubmission(chatId, message.from, message, kv);
+}
+
 
   console.log('📝 Plain text message');
   return sendPlainText(chatId, '📝 Send the exercise PDF or student answer images.');
@@ -195,7 +126,6 @@ async function queryGemini(parts) {
   const GEMINI_API_ENDPOINT = 
     `https://generativelanguage.googleapis.com/v1/models/${MODEL}:${GENERATIVE_AI_REST_RESOURCE}?key=${API_TOKEN}`;
   
-  console.log(`🔑 Using API token: ${API_TOKEN.substring(0, 10)}...`);
   
   try {
     const payload = {
@@ -246,47 +176,17 @@ function extractJsonFromMarkdown(text) {
  * ===== PDF → ANSWER KEY =====
  */
 async function handleExercisePdf(chatId, fileId, kv) {
-  console.log('📥 Processing PDF for answer key');
-  
+  console.log('📥 Processing PDF for exercise text');
+
   try {
     const pdfBase64 = await downloadTelegramFile(fileId);
     console.log(`📄 PDF downloaded, base64 length: ${pdfBase64.length}`);
 
     const prompt = `
-You are an English teacher assistant.
-Extract ALL exercises and their correct answers from this PDF.
-Return JSON ONLY — no text outside JSON.
-
-Expected structure (example):
-
-{
-  "exercises": {
-    "73": {
-      "sections": {
-        "73.1": { "answers": {...} },
-        "73.2": { "answers": {...} },
-        "73.3": { "answers": {...} },
-        ...
-      }
-    },
-    "74": {
-      "sections": {
-        "74.1": { "answers": {...} },
-        "74.2": { "answers": {...} }
-      }
-    },
-    ...
-  }
-}
-
-Rules:
-- Include every exercise number that appears in the PDF (e.g., 73, 74, 75, etc.)
-- Preserve each exercise’s internal numbering (e.g., 73.1, 74.2, etc.)
-- Lowercase everything.
-- Do NOT explain or comment.
+Extract the readable text from this PDF.
+Ignore formatting, and return ONLY plain text.
 `;
 
-    console.log('🧠 Sending PDF to Gemini...');
     const geminiResult = await queryGemini([
       { text: prompt },
       {
@@ -297,282 +197,270 @@ Rules:
       }
     ]);
 
-    const geminiText = extractGeminiText(geminiResult);
-    console.log('📋 Gemini raw response:', geminiText.substring(0, 500));
-    
-    const cleanJson = extractJsonFromMarkdown(geminiText);
-    const answerKey = JSON.parse(cleanJson);
-    console.log(`✅ Parsed answer key for exercise: ${answerKey.exercise_id}`);
+    const exerciseText = extractGeminiText(geminiResult).trim();
+    if (!exerciseText) throw new Error('No text extracted from PDF');
 
-    for (const [exerciseId, data] of Object.entries(answerKey.exercises)) {
-      await setExerciseInKV(kv, exerciseId, data);
-      await setCurrentExerciseId(kv, chatId, exerciseId);
-      console.log(`💾 Stored exercise ${exerciseId} in KV`);
+    // Generate an exercise_id (could be timestamp-based)
+    const exerciseId = Date.now().toString();
+
+    // 1️⃣ Generate ANSWER KEY (ONCE per exercise)
+    const answerKeyPrompt = `
+    You are an English teacher.
+
+    Extract ALL correct answers from this exercise.
+    Return ONLY canonical correct answers.
+
+    Rules:
+    - No explanations
+    - No student references
+    - No paraphrasing
+    - Output JSON ONLY
+
+    Schema:
+    {
+      "<section_id>": {
+        "<question_number>": "<correct_answer>"
+      }
     }
 
-    return sendPlainText(chatId, `✅ All exercises registered.\nAnswer keys created.`);
+    EXERCISE:
+    ${exerciseText}
+    `;
 
-    console.log(`💾 Stored exercise ${answerKey.exercise_id} in KV`);
-    return sendPlainText(
-      chatId,
-      `✅ Exercise ${answerKey.exercise_id} registered.\nAnswer key created.`
-    );
+    const answerKeyResult = await queryGemini([{ text: answerKeyPrompt }]);
+    const answerKeyText = extractGeminiText(answerKeyResult);
+    const answerKeyJson = extractJsonFromMarkdown(answerKeyText);
+
+    let answerKey;
+    try {
+      answerKey = JSON.parse(answerKeyJson);
+    } catch (e) {
+      throw new Error('Failed to parse answer key JSON');
+    }
+
+    // 2️⃣ Persist BOTH exercise + answer key
+    await kv.setExercise(exerciseId, {
+      text: exerciseText,
+      answer_key: answerKey
+    });
+
+    await kv.setCurrentExerciseId(chatId, exerciseId);
+
+    logInfo(`💾 Stored exercise ${exerciseId} text in KV`);
+    return sendPlainText(chatId, `✅ Exercise ${exerciseId} saved successfully.`);
   } catch (error) {
-    console.error('❌ Error processing PDF:', error);
+    logError('❌ Error processing PDF:', error);
     return sendPlainText(chatId, '❌ Error processing PDF: ' + error.message);
   }
 }
 
+
 /**
  * ===== IMAGE → STUDENT SUBMISSION =====
  */
-async function handleStudentImage(chatId, from, fileId, kv) {
-  console.log('📥 Processing student image');
-  
-  const CURRENT_EXERCISE_ID = await getCurrentExerciseId(kv, chatId);
+async function extractStudentAnswers(input, isImage = false) {
+  console.log('🧠 Extracting student answers...');
+
+  const parts = [{ text: 'Extract the text content (answers only) from this input. Return ONLY plain text — no JSON, no explanation.' }];
+
+  if (isImage) {
+    parts.push({
+      inlineData: {
+        mimeType: 'image/jpeg',
+        data: input // base64 image
+      }
+    });
+  } else {
+    parts.push({ text: input }); // plain text from user message
+  }
+
+  const result = await queryGemini(parts);
+  const extracted = extractGeminiText(result).trim();
+
+  console.log(`📝 Extracted student text (${extracted.length} chars)`);
+  return normalizeStudentAnswers(extracted);
+}
+
+/**
+ * Normalize extracted student text:
+ * - Lowercase
+ * - Remove extra whitespace
+ * - Keep punctuation minimal
+ */
+function normalizeStudentAnswers(text) {
+  return text
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/[“”]/g, '"')
+    .replace(/[’‘]/g, "'")
+    .trim();
+}
+
+
+async function handleStudentSubmission(chatId, from, message, kv) {
+  logInfo('📥 Processing student submission');
+
+  const CURRENT_EXERCISE_ID = await kv.getCurrentExerciseId(chatId);
   if (!CURRENT_EXERCISE_ID) {
-    console.log('⚠️ No exercise registered');
     return sendPlainText(chatId, '⚠️ No exercise registered yet.');
   }
+  const exercise = await kv.getExercise(CURRENT_EXERCISE_ID);
+
+  if (!exercise.answer_key) {
+    return sendPlainText(
+      chatId,
+      '⚠️ Answer key not found for this exercise.'
+    );
+  }
+
+  if (!exercise?.text) {
+    return sendPlainText(chatId, `⚠️ No exercise text found for ID ${CURRENT_EXERCISE_ID}.`);
+  }
 
   try {
-    const base64Image = await downloadTelegramFile(fileId, true);
-    console.log(`🖼️ Image downloaded, base64 length: ${base64Image.length}`);
+    let extractedAnswers = '';
 
-    const prompt = `
-You are an English teacher assistant.
-Extract ONLY the student's answers from this image.
-Detect which exercise number the answers belong to (e.g., 73, 74, 75, etc.).
-Return JSON ONLY — no explanations.
+    if (message.photo || message.document?.mime_type?.startsWith('image/')) {
+      const fileId = message.photo
+        ? message.photo.at(-1).file_id
+        : message.document.file_id;
+      const base64Image = await downloadTelegramFile(fileId, true);
+      extractedAnswers = await extractStudentAnswers(base64Image, true);
+    } else if (message.text) {
+      extractedAnswers = await extractStudentAnswers(message.text, false);
+    } else {
+      return sendPlainText(chatId, '⚠️ Unsupported message type.');
+    }
 
-Format example:
-{
-  "exercise_id": "74",
-  "sections": {
-    "74.1": { ... },
-    "74.2": { ... },
-    ...
+    const report = await gradeWithLLM(
+      exercise.text,
+      exercise.answer_key,
+      extractedAnswers,
+      CURRENT_EXERCISE_ID
+    );
+
+
+    console.log('📊 Grading complete');
+    return sendPlainText(chatId, formatGradingReport(report));
+  } catch (error) {
+    logError('❌ Error processing student submission:', error);
+    return sendPlainText(chatId, '❌ Error: ' + error.message);
   }
 }
-Lowercase everything.
+
+
+async function gradeWithLLM( exerciseText, answerKey, studentText, exerciseId) {
+  console.log('🧮 Sending grading prompt to Gemini');
+  
+  // Log the inputs to see what's being sent
+  console.log('=== EXERCISE TEXT (first 500 chars) ===');
+  console.log(exerciseText.substring(0, 500));
+  console.log('\n=== STUDENT ANSWERS ===');
+  console.log(studentText);
+  console.log('=======================\n');
+
+  const prompt = `
+You are an experienced English teacher grading past perfect exercises.
+
+TASK:
+Compare student answers with the answer key.
+
+CORRECTNESS RULES:
+- Focus ONLY on meaning (tense usage).
+- Ignore spelling, punctuation, capitalization.
+- Ignore minor grammar mistakes.
+- If meaning matches → CORRECT.
+
+IMPORTANT:
+- Do NOT rewrite correct answers.
+- Do NOT improve style.
+- Do NOT penalize spelling.
+- If a question is NOT answered by the student → IGNORE it.
+- Only include corrections for answers with WRONG meaning.
+
+OUTPUT:
+- JSON ONLY.
+- Full corrected sentences only.
+
+Schema:
+{
+  "exercise_id": "...",
+  "sections": {
+    "<section_id>": {
+      "all_correct": true | false,
+      "corrections": {
+        "<question_number>": "<full correct sentence>"
+      }
+    }
+  }
+}
+
+ANSWER KEY:
+${JSON.stringify(answerKey, null, 2)}
+
+STUDENT ANSWERS:
+${studentText}
 `;
 
-    console.log('🧠 Sending image to Gemini...');
-    const geminiResult = await queryGemini([
-      { text: prompt },
-      {
-        inlineData: {
-          mimeType: 'image/jpeg',
-          data: base64Image
-        }
-      }
-    ]);
 
-    const geminiText = extractGeminiText(geminiResult);
-    console.log('📋 Gemini raw response:', geminiText.substring(0, 500));
+  console.log('=== PROMPT SENT TO GEMINI ===');
+  console.log(prompt.substring(0, 1000));
+  console.log('=============================\n');
+
+  const result = await queryGemini([{ text: prompt }]);
+  const geminiText = extractGeminiText(result);
+  
+  console.log('=== RAW GEMINI RESPONSE ===');
+  console.log(geminiText);
+  console.log('===========================\n');
+
+  const cleanJson = extractJsonFromMarkdown(geminiText);
+  
+  console.log('=== CLEANED JSON ===');
+  console.log(cleanJson);
+  console.log('====================\n');
+
+  try {
+    const report = JSON.parse(cleanJson);
+    console.log('=== PARSED REPORT ===');
+    console.log(JSON.stringify(report, null, 2));
+    console.log('====================\n');
     
-    const cleanJson = extractJsonFromMarkdown(geminiText);
-    const submission = JSON.parse(cleanJson);
-    const studentId = from.id;
-    const exerciseId = submission.exercise_id;
-
-    if (!exerciseId) {
-      console.log('⚠️ Gemini did not return an exercise_id');
-      return sendPlainText(chatId, '⚠️ Could not detect which exercise this is for.');
+    // Validate the structure
+    if (!report.sections) {
+      console.error('❌ Missing "sections" in report');
+      throw new Error('Invalid report structure: missing sections');
     }
-
-    console.log(`👨‍🎓 Student ${studentId} submission extracted for exercise ${exerciseId}`);
-
-    // ✅ Save to KV for persistence
-    await saveSubmissionToKV(kv, exerciseId, studentId, submission);
-
-    const answerKey = await getExerciseFromKV(kv, exerciseId);
-    if (!answerKey) {
-      console.log(`⚠️ No answer key found for exercise ${exerciseId}`);
-      return sendPlainText(chatId, `⚠️ No answer key found for exercise ${exerciseId}.`);
-    }
-
-    const report = gradeSubmission(submission, answerKey);
-
-    console.log('📊 Grading complete');
-    return sendPlainText(chatId, buildReport(report));
-
-    console.log('📊 Grading complete');
-    return sendPlainText(chatId, buildReport(report));
-  } catch (error) {
-    console.error('❌ Error processing image:', error);
-    return sendPlainText(chatId, '❌ Error processing image: ' + error.message);
-  }
-}
-
-/**
- * ====== SUBMISSIONS KV HELPERS ======
- */
-async function getSubmissionsFromKV(kv, exerciseId) {
-  try {
-    if (!kv) {
-      console.log('⚠️ KV not available, using in-memory fallback');
-      return SUBMISSIONS[exerciseId] || {};
-    }
-    const data = await kv.get(`submissions:${exerciseId}`, 'json');
-    console.log(`📦 KV.get(submissions:${exerciseId}) returned:`, data ? 'found' : 'null');
-    return data || {};
+    
+    return report;
   } catch (err) {
-    console.error('❌ KV.get submissions error:', err);
-    return {};
+    console.error('❌ JSON parse error:', err.message);
+    console.error('Failed JSON:', cleanJson);
+    throw new Error('Gemini returned invalid JSON');
   }
 }
 
-async function saveSubmissionToKV(kv, exerciseId, studentId, submission) {
-  try {
-    if (!kv) {
-      console.log('⚠️ KV not available, updating in-memory fallback');
-      if (!SUBMISSIONS[exerciseId]) SUBMISSIONS[exerciseId] = {};
-      SUBMISSIONS[exerciseId][studentId] = submission;
-      return;
-    }
 
-    const current = await getSubmissionsFromKV(kv, exerciseId);
-    current[studentId] = submission;
-
-    await kv.put(`submissions:${exerciseId}`, JSON.stringify(current));
-    console.log(`💾 Saved submission for student ${studentId} in KV`);
-  } catch (err) {
-    console.error('❌ KV.put submissions error:', err);
-  }
-}
-
-/**
- * ===== GRADING ENGINE =====
- */
-function normalize(s) {
-  return s.toLowerCase().replace(/[-_]/g, ' ').replace(/\s+/g, ' ').trim();
-}
-
-function gradeSubmission(sub, key) {
-  console.log('📝 Grading submission...');
-
-  const results = {};
-  const studentSections = sub.sections || {};
-  const keySections = key.sections || {};
-
-  for (const [sectionName, studentSection] of Object.entries(studentSections)) {
-    console.log(`📊 Grading section ${sectionName}`);
-
-    // Find the corresponding section in the key
-    const keySection = keySections[sectionName];
-    if (!keySection) {
-      console.log(`⚠️ No key found for section ${sectionName}`);
-      results[sectionName] = ['⚠️ Section not found in answer key'];
-      continue;
-    }
-
-    // Decide which grading logic applies based on structure
-    if (keySection.categories) {
-      results[sectionName] = grade731(studentSection, keySection);
-    } else if (keySection.answers) {
-      results[sectionName] = grade732(studentSection, keySection);
-    } else if (keySection.lexical_invalid) {
-      results[sectionName] = grade733(studentSection, keySection);
-    } else {
-      results[sectionName] = ['⚠️ Unknown section type'];
-    }
-  }
-
-  return results;
-}
+// Submissions are handled by KVStore.getSubmissions
 
 
-function grade731(student, key) {
-  console.log('📊 Grading section 73.1');
-  const errors = [];
-  if (!student) {
-    console.log('⚠️ No student data for 73.1');
-    return errors;
-  }
-
-  for (const [cat, items] of Object.entries(student)) {
-    for (const item of items) {
-      const n = normalize(item);
-      for (const [correctCat, correctItems] of Object.entries(key.categories)) {
-        if (correctItems.includes(n) && correctCat !== cat && n === 'chest of drawers') {
-          errors.push("We don't wear chest of drawers ❌");
-        }
-      }
-    }
-  }
-  console.log(`✅ 73.1 errors: ${errors.length}`);
-  return errors;
-}
-
-function grade732(student, key) {
-  console.log('📊 Grading section 73.2');
-  const wrong = [];
-  if (!student) {
-    console.log('⚠️ No student data for 73.2');
-    return wrong;
-  }
-  if (!key || !key.answers) {
-    console.log('⚠️ No answer key data for 73.2');
-    return wrong;
-  }
-
-  for (const [q, ans] of Object.entries(student)) {
-    let correctAnswers = key.answers[q];
-
-    if (!correctAnswers) {
-      console.log(`⚠️ Question ${q} missing in key`);
-      wrong.push(`${q}.${ans} (unknown question)`);
-      continue;
-    }
-
-    // ✅ Ensure correctAnswers is always an array
-    if (!Array.isArray(correctAnswers)) {
-      correctAnswers = [correctAnswers];
-    }
-
-    if (!correctAnswers.map(normalize).includes(normalize(ans))) {
-      wrong.push(`${q}.${ans}`);
-    }
-  }
-
-  console.log(`✅ 73.2 wrong answers: ${wrong.length}`);
-  return wrong;
-}
-
-
-function grade733(student, key) {
-  console.log('📊 Grading section 73.3');
-  const notes = [];
-  if (!student) {
-    console.log('⚠️ No student data for 73.3');
-    return notes;
-  }
-
-  for (const [q, ans] of Object.entries(student)) {
-    if (key.lexical_invalid.includes(normalize(ans))) {
-      notes.push(
-        `1. Bus stop / full-time\n( ${ans} is not a real English word❌)`
-      );
-    }
-  }
-  console.log(`✅ 73.3 notes: ${notes.length}`);
-  return notes;
-}
 
 /**
  * ===== REPORT BUILDER =====
  */
-function buildReport(results) {
-  console.log('📈 Building report...');
+
+function formatGradingReport(report) {
   let text = '';
 
-  for (const [section, feedback] of Object.entries(results)) {
-    text += `\n${section}\n`;
-    if (feedback.length === 0) {
-      text += '✅ All correct\n';
+  for (const [section, result] of Object.entries(report.sections)) {
+    if (result.all_correct) {
+      text += `${section} ✅✅✅\n\n`;
     } else {
-      text += feedback.join('\n') + '\n';
+      text += `${section}\n`;
+      for (const [q, ans] of Object.entries(result.corrections || {})) {
+        text += `${q}. ${ans}\n`;
+      }
+      text += `The rest ✅✅✅\n\n`;
     }
   }
 
@@ -584,21 +472,29 @@ function buildReport(results) {
  * ===== TELEGRAM HELPERS =====
  */
 async function downloadTelegramFile(fileId, isImage = false) {
-  console.log(`📥 Downloading file: ${fileId}`);
-  
+  logInfo(`📥 Downloading file: ${fileId}`);
+
   const meta = await fetch(apiUrl('getFile', { file_id: fileId })).then(r => r.json());
   if (!meta.ok) {
     throw new Error(`Telegram API error: ${JSON.stringify(meta)}`);
   }
-  
+
   const filePath = meta.result.file_path;
-  console.log(`📁 File path: ${filePath}`);
-  
+  logInfo(`📁 File path: ${filePath}`);
+
   const file = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${filePath}`);
   const buf = await file.arrayBuffer();
-  console.log(`✅ Downloaded ${buf.byteLength} bytes`);
-  
-  return arrayBufferToBase64(buf);
+  logInfo(`✅ Downloaded ${buf.byteLength} bytes`);
+
+  // Inline arrayBuffer -> base64 conversion (small helper used only here)
+  const bytes = new Uint8Array(buf);
+  const chunkSize = 0x8000; // 32KB chunks
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode.apply(null, chunk);
+  }
+  return btoa(binary);
 }
 
 function apiUrl(method, params = {}) {
@@ -606,33 +502,23 @@ function apiUrl(method, params = {}) {
 }
 
 async function sendPlainText(chatId, text) {
-  console.log(`💬 Sending message to ${chatId}: ${text.substring(0, 100)}...`);
+  logInfo(`💬 Sending message to ${chatId}: ${text.substring(0, 100)}...`);
   try {
     const response = await fetch(apiUrl('sendMessage', { chat_id: chatId, text }));
     const result = await response.json();
     if (!result.ok) {
-      console.error('❌ Telegram send error:', JSON.stringify(result));
+      logError('❌ Telegram send error:', JSON.stringify(result));
     } else {
-      console.log('✅ Message sent successfully');
+      logInfo('✅ Message sent successfully');
     }
     return result;
   } catch (error) {
-    console.error('❌ Error sending message:', error);
+    logError('❌ Error sending message:', error);
     throw error;
   }
 }
 
-function arrayBufferToBase64(buffer) {
-  const bytes = new Uint8Array(buffer);
-  const chunkSize = 0x8000; // 32KB chunks
-  let binary = '';
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    // use apply on small chunks to avoid spreading a huge array into the call
-    const chunk = bytes.subarray(i, i + chunkSize);
-    binary += String.fromCharCode.apply(null, chunk);
-  }
-  return btoa(binary);
-}
+// arrayBufferToBase64 inlined inside downloadTelegramFile
 
 /**
  * Webhook management
